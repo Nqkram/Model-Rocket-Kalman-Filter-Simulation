@@ -5,7 +5,7 @@
 This project demonstrates a **model rocket telemetry and state estimation system** implemented on a **Teensy 4.1** microcontroller.
 Sensor measurements are processed using a **Kalman filter** to reduce noise and produce stable estimates of the rocket’s flight state.
 
-The system simulates a rocket flight up to **4000 meters altitude**, fuses measurements from multiple sensors, and displays the processed data on an **I2C LCD display** while also providing telemetry through the serial monitor.
+The system simulates a rocket flight up to **Max altitude: 5357 m**, fuses measurements from multiple sensors, and displays the processed data on an **I2C LCD display** while also providing telemetry through the serial monitor.
 
 The project focuses on **state estimation, sensor fusion, and embedded flight computation**.
 
