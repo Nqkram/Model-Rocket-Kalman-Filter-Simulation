@@ -1,0 +1,557 @@
+// Rocket Telemetry - 6-DOF Kalman Filter
+// Teensy 4.1 + LCD 16x2 I2C (0x27)
+// LCD: VCC=3.3V  GND=GND  SDA=Pin18  SCL=Pin19
+// Serial Monitor 115200 -- commands: start / step / run N / run full / reset / help
+
+#include <Arduino.h>
+#include <math.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+typedef long double ld;
+
+#ifndef M_PIl
+  static const ld M_PIl = 3.141592653589793238462643383279502884L;
+#endif
+
+// rocket parameters
+static const ld ROKET_ITME = 1800.0L;
+static const ld ROKET_KG   = 12.0L;
+static const ld YAKIT_KG   = 5.0L;
+static const ld MOTOR_SURE = 3.5L;
+static const ld CD         = 0.45L;
+static const ld A_KESIT    = 0.008L;
+static const ld DT         = 0.05L;
+
+// ISA atmosphere
+static const ld G     = 9.80665L;
+static const ld R_AIR = 287.058L;
+static const ld T0    = 288.15L;
+static const ld P0    = 101325.0L;
+static const ld L     = 0.0065L;
+
+template<int R, int C>
+struct Mat {
+  ld d[R][C];
+
+  Mat() {
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        d[i][j] = 0.0L;
+  }
+
+  void eye() {
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        d[i][j] = (i == j) ? 1.0L : 0.0L;
+  }
+
+  Mat<C,R> T() const {
+    Mat<C,R> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[j][i] = d[i][j];
+    return out;
+  }
+
+  template<int K>
+  Mat<R,K> operator*(const Mat<C,K>& b) const {
+    Mat<R,K> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < K; j++)
+        for (int k = 0; k < C; k++)
+          out.d[i][j] += d[i][k] * b.d[k][j];
+    return out;
+  }
+
+  Mat<R,C> operator+(const Mat<R,C>& b) const {
+    Mat<R,C> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[i][j] = d[i][j] + b.d[i][j];
+    return out;
+  }
+
+  Mat<R,C> operator-(const Mat<R,C>& b) const {
+    Mat<R,C> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[i][j] = d[i][j] - b.d[i][j];
+    return out;
+  }
+
+  Mat<R,C> operator*(ld s) const {
+    Mat<R,C> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[i][j] = d[i][j] * s;
+    return out;
+  }
+};
+
+// Square matrix inverse via Gauss-Jordan
+template<int N>
+Mat<N,N> matInv(const Mat<N,N>& A) {
+  ld a[N][N], inv[N][N];
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++) {
+      a[i][j]   = A.d[i][j];
+      inv[i][j] = (i == j) ? 1.0L : 0.0L;
+    }
+
+  for (int col = 0; col < N; col++) {
+    int pivot = col;
+    for (int row = col+1; row < N; row++)
+      if (fabsl(a[row][col]) > fabsl(a[pivot][col])) pivot = row;
+
+    for (int j = 0; j < N; j++) {
+      ld tmp  = a[col][j];   a[col][j]   = a[pivot][j];   a[pivot][j]   = tmp;
+      tmp     = inv[col][j]; inv[col][j] = inv[pivot][j]; inv[pivot][j] = tmp;
+    }
+
+    ld div = a[col][col];
+    if (fabsl(div) < 1e-30L) continue;
+
+    for (int j = 0; j < N; j++) {
+      a[col][j]   /= div;
+      inv[col][j] /= div;
+    }
+
+    for (int row = 0; row < N; row++) {
+      if (row == col) continue;
+      ld factor = a[row][col];
+      for (int j = 0; j < N; j++) {
+        a[row][j]   -= factor * a[col][j];
+        inv[row][j] -= factor * inv[col][j];
+      }
+    }
+  }
+
+  Mat<N,N> out;
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++)
+      out.d[i][j] = inv[i][j];
+  return out;
+}
+
+
+ld irtifahaBasinc(ld h) {
+  if (h < 0.0L) h = 0.0L;
+  return P0 * powl(1.0L - L * h / T0, G / (R_AIR * L));
+}
+
+ld basincaIrtifa(ld P) {
+  if (P <= 0.0L) return 0.0L;
+  return (T0 / L) * (1.0L - powl(P / P0, R_AIR * L / G));
+}
+
+ld yogunluk(ld h) {
+  if (h < 0.0L) h = 0.0L;
+  return irtifahaBasinc(h) / (R_AIR * (T0 - L * h));
+}
+
+struct RoketDurumu {
+  ld zaman, irtifa, hiz, ivme;
+  ld roll, pitch, yaw;
+  ld roll_rate, pitch_rate, yaw_rate;
+  ld kitle;
+  bool motorAktif, apogee, indi;
+};
+
+struct KalmanFiltresi {
+  Mat<6,1> x;
+  Mat<6,6> P;
+  Mat<6,6> F;
+  Mat<6,6> Q;
+  Mat<4,6> H;
+  Mat<4,4> R_mat;
+  Mat<6,4> K;
+  Mat<4,1> inovasyon;
+
+  void baslat(ld baslangic_irtifa) {
+    x.d[0][0] = baslangic_irtifa;
+
+    P.eye();
+    P.d[0][0] = 10.0L;
+    P.d[1][1] = 1.0L;
+    P.d[2][2] = 0.5L;
+    P.d[3][3] = 0.01L;
+    P.d[4][4] = 0.01L;
+    P.d[5][5] = 0.01L;
+
+    Q.d[0][0] = 0.1L;
+    Q.d[1][1] = 0.5L;
+    Q.d[2][2] = 1.0L;
+    Q.d[3][3] = 0.001L;
+    Q.d[4][4] = 0.001L;
+    Q.d[5][5] = 0.001L;
+
+    H.d[0][0] = 1.0L;
+    H.d[1][0] = 1.0L;
+    H.d[2][2] = 1.0L;
+    H.d[3][2] = 1.0L;
+
+    R_mat.d[0][0] = 0.25L;
+    R_mat.d[1][1] = 0.30L;
+    R_mat.d[2][2] = 0.04L;
+    R_mat.d[3][3] = 0.05L;
+  }
+
+  void tahmin(ld dt, ld dis_ivme) {
+    F.eye();
+    F.d[0][1] = dt;
+    F.d[0][2] = 0.5L * dt * dt;
+    F.d[1][2] = dt;
+
+    Mat<6,1> u;
+    u.d[2][0] = dis_ivme;
+
+    x = F * x + u;
+    P = F * P * F.T() + Q;
+  }
+
+  void guncelle(ld baro1_h, ld baro2_h, ld acc1_z, ld acc2_z) {
+    Mat<4,1> z;
+    z.d[0][0] = baro1_h;
+    z.d[1][0] = baro2_h;
+    z.d[2][0] = acc1_z;
+    z.d[3][0] = acc2_z;
+
+    inovasyon = z - H * x;
+
+    Mat<4,4> S = H * P * H.T() + R_mat;
+    K = P * H.T() * matInv<4>(S);
+    x = x + K * inovasyon;
+
+    Mat<6,6> I; I.eye();
+    P = (I - K * H) * P;
+  }
+
+  ld irtifa() const { return x.d[0][0]; }
+  ld hiz()    const { return x.d[1][0]; }
+  ld ivme()   const { return x.d[2][0]; }
+  ld roll()   const { return x.d[3][0]; }
+  ld pitch()  const { return x.d[4][0]; }
+  ld yaw()    const { return x.d[5][0]; }
+};
+
+ld gaussGurultu(ld sigma) {
+  static bool hazir = false;
+  static ld   yedek = 0.0L;
+  if (hazir) { hazir = false; return yedek * sigma; }
+  ld u1 = (ld)random(1, 1000000) / 1000000.0L;
+  ld u2 = (ld)random(1, 1000000) / 1000000.0L;
+  ld z0 = sqrtl(-2.0L * logl(u1)) * cosl(2.0L * M_PIl * u2);
+  ld z1 = sqrtl(-2.0L * logl(u1)) * sinl(2.0L * M_PIl * u2);
+  yedek = z1;
+  hazir = true;
+  return z0 * sigma;
+}
+
+RoketDurumu    roket;
+KalmanFiltresi kalman;
+bool           simBasladi = false;
+int            adimSayisi = 0;
+
+uint8_t        lcdSayfa    = 0;
+elapsedMillis  lcdSayfaMs;
+const uint16_t LCD_SAYFA_MS = 3000;
+
+void roketAdim() {
+  ld dt = DT;
+
+  if (roket.motorAktif) {
+    roket.kitle -= (YAKIT_KG / MOTOR_SURE) * dt;
+    if (roket.kitle < (ROKET_KG - YAKIT_KG))
+      roket.kitle = ROKET_KG - YAKIT_KG;
+  }
+
+  roket.motorAktif = (roket.zaman < MOTOR_SURE && roket.kitle > (ROKET_KG - YAKIT_KG + 0.01L));
+
+  ld F_motor     = roket.motorAktif ? ROKET_ITME : 0.0L;
+  ld rho         = yogunluk(roket.irtifa);
+  ld F_surukleme = 0.5L * rho * roket.hiz * fabsl(roket.hiz) * CD * A_KESIT;
+  ld F_net       = F_motor - roket.kitle * G - F_surukleme;
+
+  roket.ivme = F_net / roket.kitle;
+
+  if (!roket.apogee && roket.hiz < 0.0L && roket.irtifa > 10.0L)
+    roket.apogee = true;
+
+  if (roket.irtifa <= 0.0L && roket.zaman > 1.0L) {
+    roket.irtifa = 0.0L;
+    roket.hiz    = 0.0L;
+    roket.ivme   = 0.0L;
+    roket.indi   = true;
+  }
+
+  if (!roket.indi) {
+    roket.hiz    += roket.ivme * dt;
+    roket.irtifa += roket.hiz  * dt;
+    if (roket.irtifa < 0.0L) roket.irtifa = 0.0L;
+  }
+
+  roket.roll  += gaussGurultu(0.005L);
+  roket.pitch += gaussGurultu(0.003L);
+  roket.yaw   += gaussGurultu(0.003L);
+
+  roket.zaman += dt;
+}
+
+void kalmanAdim() {
+  ld h   = roket.irtifa;
+  ld acc = roket.ivme;
+
+  ld baro1_h = basincaIrtifa(irtifahaBasinc(h) + gaussGurultu(2.0L));
+  ld baro2_h = basincaIrtifa(irtifahaBasinc(h) + gaussGurultu(2.5L));
+  ld acc1_z  = acc + gaussGurultu(0.2L);
+  ld acc2_z  = acc + gaussGurultu(0.25L);
+
+  kalman.tahmin(DT, acc);
+  kalman.guncelle(baro1_h, baro2_h, acc1_z, acc2_z);
+}
+
+void durumYaz() {
+  uint32_t t0 = micros();
+
+  ld P_hPa = irtifahaBasinc(roket.irtifa) / 100.0L;
+  ld K_00  = kalman.K.d[0][0];
+  ld K_11  = kalman.K.d[1][1];
+  ld K_22  = kalman.K.d[2][2];
+
+  uint32_t islem_us = micros() - t0;
+
+  Serial.println(F("┌─────────────────────────────────────────────────────┐"));
+  Serial.print(F("│  Step: ")); Serial.print(adimSayisi);
+  Serial.print(F("   t = ")); Serial.print((double)roket.zaman, 3);
+  Serial.println(F(" s"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  TRUE VALUES"));
+  Serial.print(F("│  Altitude : ")); Serial.print((double)roket.irtifa, 4); Serial.println(F(" m"));
+  Serial.print(F("│  Velocity : ")); Serial.print((double)roket.hiz,    4); Serial.println(F(" m/s"));
+  Serial.print(F("│  Accel    : ")); Serial.print((double)roket.ivme,   4); Serial.println(F(" m/s²"));
+  Serial.print(F("│  Roll     : ")); Serial.print((double)(roket.roll  * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Pitch    : ")); Serial.print((double)(roket.pitch * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Yaw      : ")); Serial.print((double)(roket.yaw   * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Pressure : ")); Serial.print((double)P_hPa, 4); Serial.println(F(" hPa"));
+  Serial.print(F("│  Mass     : ")); Serial.print((double)roket.kitle, 3); Serial.println(F(" kg"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  KALMAN FILTER"));
+  Serial.print(F("│  Altitude : ")); Serial.print((double)kalman.irtifa(), 4); Serial.println(F(" m"));
+  Serial.print(F("│  Velocity : ")); Serial.print((double)kalman.hiz(),    4); Serial.println(F(" m/s"));
+  Serial.print(F("│  Accel    : ")); Serial.print((double)kalman.ivme(),   4); Serial.println(F(" m/s²"));
+  Serial.print(F("│  Roll     : ")); Serial.print((double)(kalman.roll()  * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Pitch    : ")); Serial.print((double)(kalman.pitch() * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Yaw      : ")); Serial.print((double)(kalman.yaw()   * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  KALMAN GAIN"));
+  Serial.print(F("│  K[0,0] Altitude : ")); Serial.println((double)K_00, 6);
+  Serial.print(F("│  K[1,1] Velocity : ")); Serial.println((double)K_11, 6);
+  Serial.print(F("│  K[2,2] Accel    : ")); Serial.println((double)K_22, 6);
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  INNOVATION"));
+  Serial.print(F("│  Δ Baro1  : ")); Serial.print((double)kalman.inovasyon.d[0][0], 4); Serial.println(F(" m"));
+  Serial.print(F("│  Δ Baro2  : ")); Serial.print((double)kalman.inovasyon.d[1][0], 4); Serial.println(F(" m"));
+  Serial.print(F("│  Δ Acc1   : ")); Serial.print((double)kalman.inovasyon.d[2][0], 4); Serial.println(F(" m/s²"));
+  Serial.print(F("│  Δ Acc2   : ")); Serial.print((double)kalman.inovasyon.d[3][0], 4); Serial.println(F(" m/s²"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.print(F("│  Motor    : ")); Serial.println(roket.motorAktif ? F("ACTIVE") : F("OFF"));
+  Serial.print(F("│  Apogee   : ")); Serial.println(roket.apogee ? F("PASSED") : F("Not yet"));
+  Serial.print(F("│  Elapsed  : ")); Serial.print(islem_us); Serial.println(F(" µs"));
+  Serial.println(F("└─────────────────────────────────────────────────────┘"));
+  Serial.println();
+}
+
+String sabitGenislik(double val, int toplam, int ondalik) {
+  String s = String(val, ondalik);
+  while ((int)s.length() < toplam) s = " " + s;
+  if ((int)s.length() > toplam)    s = s.substring(0, toplam);
+  return s;
+}
+
+void lcdSatirYaz(uint8_t satir, String metin) {
+  while ((int)metin.length() < 16) metin += " ";
+  if ((int)metin.length() > 16)    metin  = metin.substring(0, 16);
+  lcd.setCursor(0, satir);
+  lcd.print(metin);
+}
+
+void lcdGuncelle() {
+  if (lcdSayfaMs >= LCD_SAYFA_MS) {
+    lcdSayfaMs = 0;
+    lcdSayfa   = (lcdSayfa + 1) % 3;
+  }
+
+  double irtifa  = (double)kalman.irtifa();
+  double hiz     = (double)kalman.hiz();
+  double ivme    = (double)kalman.ivme();
+  double P_hPa   = (double)(irtifahaBasinc(roket.irtifa) / 100.0L);
+  double roll_d  = (double)(kalman.roll()  * 180.0L / M_PIl);
+  double pitch_d = (double)(kalman.pitch() * 180.0L / M_PIl);
+  double yaw_d   = (double)(kalman.yaw()   * 180.0L / M_PIl);
+
+  String durum;
+  if      (roket.motorAktif) durum = "MTR!";
+  else if (roket.indi)       durum = "INDI";
+  else if (roket.apogee)     durum = "APOG";
+  else                       durum = "UCUS";
+
+  String s0, s1;
+  switch (lcdSayfa) {
+    case 0:
+      s0 = "H:" + sabitGenislik(irtifa, 7, 1) + "m " + durum;
+      s1 = "V:" + sabitGenislik(hiz, 9, 2) + "m/s";
+      break;
+    case 1:
+      s0 = "A:" + sabitGenislik(ivme,  9, 2) + "m/s2";
+      s1 = "P:" + sabitGenislik(P_hPa, 7, 1) + " hPa  ";
+      break;
+    case 2:
+      s0 = "R:" + sabitGenislik(roll_d,  4, 1) + " Pi:" + sabitGenislik(pitch_d, 4, 1);
+      s1 = "Y:" + sabitGenislik(yaw_d,   4, 1) + " t:"  + sabitGenislik((double)roket.zaman, 5, 1) + "s";
+      break;
+  }
+
+  lcdSatirYaz(0, s0);
+  lcdSatirYaz(1, s1);
+}
+
+void simReset() {
+  roket = {0};
+  roket.kitle = ROKET_KG;
+  kalman.baslat(0.0L);
+  simBasladi = false;
+  adimSayisi = 0;
+  Serial.println(F(">> Reset."));
+}
+
+void yardim() {
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+  Serial.println(F("  ROCKET SIMULATOR — Command List"));
+  Serial.println(F("  Teensy 4.1 | 6-DOF Kalman | Dual Sensor Fusion"));
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+  Serial.println(F("  start      -> Start simulation"));
+  Serial.println(F("  step       -> Advance one step (0.05s)"));
+  Serial.println(F("  run N      -> Run N steps  (e.g. run 100)"));
+  Serial.println(F("  run full   -> Run until landing"));
+  Serial.println(F("  status     -> Show current values"));
+  Serial.println(F("  reset      -> Reset"));
+  Serial.println(F("  help       -> This list"));
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+  Serial.print(F("  Thrust: "));   Serial.print((double)ROKET_ITME); Serial.println(F(" N"));
+  Serial.print(F("  Mass:   "));  Serial.print((double)ROKET_KG);   Serial.println(F(" kg"));
+  Serial.print(F("  Fuel:   "));  Serial.print((double)YAKIT_KG);   Serial.println(F(" kg"));
+  Serial.print(F("  Burn:   "));  Serial.print((double)MOTOR_SURE); Serial.println(F(" s"));
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);
+
+  Wire.begin();
+  Wire.setClock(400000);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Roket Kalman");
+  lcd.setCursor(0, 1); lcd.print("Teensy 4.1 6DOF");
+  delay(2000);
+  lcd.clear();
+
+  randomSeed(analogRead(A0) ^ micros());
+
+  simReset();
+  yardim();
+  Serial.println(F(">> Type 'start' and press Enter."));
+
+  lcd.setCursor(0, 0); lcd.print("'start' yazin");
+  lcd.setCursor(0, 1); lcd.print("Serial Monitor");
+}
+
+void loop() {
+  if (!Serial.available()) return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toLowerCase();
+
+  if (cmd == "help") {
+    yardim();
+
+  } else if (cmd == "start") {
+    if (!simBasladi) {
+      simBasladi = true;
+      lcdSayfa   = 0;
+      lcdSayfaMs = 0;
+      Serial.println(F(">> Started! Type 'run full' to launch."));
+      roketAdim();
+      kalmanAdim();
+      adimSayisi++;
+      lcdGuncelle();
+    } else {
+      Serial.println(F(">> Already running. Type 'reset'."));
+    }
+
+  } else if (cmd == "step") {
+    if (!simBasladi) { Serial.println(F(">> Type 'start' first.")); return; }
+    if (roket.indi)  { Serial.println(F(">> Rocket landed. Type 'reset'.")); return; }
+    roketAdim();
+    kalmanAdim();
+    adimSayisi++;
+    durumYaz();
+    lcdGuncelle();
+
+  } else if (cmd.startsWith("run")) {
+    if (!simBasladi) { Serial.println(F(">> Type 'start' first.")); return; }
+
+    String arg = cmd.substring(4);
+    arg.trim();
+    bool full  = (arg == "full");
+    int  n     = full ? 0 : arg.toInt();
+    if (!full && n <= 0) { Serial.println(F(">> Example: run 80")); return; }
+
+    int sayac = 0;
+    while (!roket.indi) {
+      if (!full && sayac >= n) break;
+      roketAdim();
+      kalmanAdim();
+      adimSayisi++;
+      sayac++;
+      lcdGuncelle();
+      if (sayac % 20 == 0 || roket.indi) {
+        durumYaz();
+        delay(10);
+      }
+    }
+
+    Serial.print(F(">> ")); Serial.print(sayac); Serial.println(F(" steps done."));
+
+    if (roket.indi) {
+      Serial.println(F(">> Rocket landed!"));
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("INIS TAMAMLANDI");
+      lcd.setCursor(0, 1);
+      lcd.print("t=");
+      lcd.print((double)roket.zaman, 1);
+      lcd.print("s  'reset'");
+    }
+
+  } else if (cmd == "status") {
+    durumYaz();
+    lcdGuncelle();
+
+  } else if (cmd == "reset") {
+    simReset();
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("Sifirlandi.");
+    lcd.setCursor(0, 1); lcd.print("'start' bekliyor");
+
+  } else if (cmd.length() > 0) {
+    Serial.print(F(">> Unknown: '"));
+    Serial.print(cmd);
+    Serial.println(F("'  -- type 'help'."));
+  }
+}

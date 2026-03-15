@@ -1,0 +1,793 @@
+/*
+  ================================================================
+  ROKET TELEMETRİSİ — Full 6-DOF Kalman Filtresi
+  Teensy 4.1 | USB Serial Monitor | long double hassasiyet
+  ================================================================
+
+  Sistem:
+    - 4000m'ye çıkan roket simülasyonu
+    - İki basınç sensörü → Sensor Fusion (Kalman ile birleştirilir)
+    - Full 6-DOF durum vektörü:
+        x = [irtifa, hız_z, ivme_z, roll, pitch, yaw]
+    - Her adımda işlem süresi µs cinsinden raporlanır
+
+  Kullanım (Serial Monitor, 115200 baud):
+    > start        → simülasyonu başlat
+    > step         → tek adım ilerlet
+    > run N        → N adım otomatik koş
+    > reset        → sıfırla
+    > status       → mevcut durumu göster
+    > help         → komut listesi
+
+  Matris boyutları:
+    Durum (x):          6×1
+    Geçiş (F):          6×6
+    Gürültü (Q):        6×6
+    Ölçüm (H):          4×6  (2 basınç + 2 ivmemetre)
+    Ölçüm gürültüsü(R): 4×4
+    Kovaryans (P):      6×6
+    Kalman kazancı (K): 6×4
+
+  ================================================================
+*/
+
+#include <Arduino.h>
+#include <math.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// LCD: 0x27 adres, 16 sütun, 2 satır
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ----------------------------------------------------------------
+//  Tip kısaltması — her yerde long double kullan
+// ----------------------------------------------------------------
+typedef long double ld;
+
+// M_PIl bazı toolchain'lerde tanımsız gelir — elle tanımlıyoruz
+#ifndef M_PIl
+  static const ld M_PIl = 3.141592653589793238462643383279502884L;
+#endif
+
+// ----------------------------------------------------------------
+//  Sabitler
+// ----------------------------------------------------------------
+static const ld G          = 9.80665L;       // m/s²
+static const ld R_AIR      = 287.058L;       // J/(kg·K)
+static const ld T0         = 288.15L;        // K  (deniz seviyesi)
+static const ld P0         = 101325.0L;      // Pa (deniz seviyesi)
+static const ld L          = 0.0065L;        // K/m lapse rate
+static const ld ROKET_ITME = 1800.0L;        // N  (motor iticiliği)
+static const ld ROKET_KG   = 12.0L;          // kg (kalkış kütlesi)
+static const ld YAKIT_KG   = 5.0L;           // kg (yakıt kütlesi)
+static const ld MOTOR_SURE = 3.5L;           // s  (motor yanma süresi)
+static const ld CD         = 0.45L;          // Sürükleme katsayısı
+static const ld A_KESIT    = 0.008L;         // m² (kesit alanı ~10cm çap)
+static const ld DT         = 0.05L;          // s  (simülasyon adım süresi)
+static const int N_STATE   = 6;              // durum boyutu
+static const int N_MEAS    = 4;              // ölçüm boyutu
+
+// ----------------------------------------------------------------
+//  Matris sınıfı (stack üzerinde, sabit boyut)
+// ----------------------------------------------------------------
+template<int R, int C>
+struct Mat {
+  ld d[R][C];
+
+  Mat() { zero(); }
+
+  void zero() {
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        d[i][j] = 0.0L;
+  }
+
+  void eye() {
+    zero();
+    int mn = R < C ? R : C;
+    for (int i = 0; i < mn; i++) d[i][i] = 1.0L;
+  }
+
+  // Transpoz
+  Mat<C,R> T() const {
+    Mat<C,R> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[j][i] = d[i][j];
+    return out;
+  }
+
+  // Matris çarpımı
+  template<int K>
+  Mat<R,K> operator*(const Mat<C,K>& b) const {
+    Mat<R,K> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < K; j++)
+        for (int k = 0; k < C; k++)
+          out.d[i][j] += d[i][k] * b.d[k][j];
+    return out;
+  }
+
+  // Toplama
+  Mat<R,C> operator+(const Mat<R,C>& b) const {
+    Mat<R,C> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[i][j] = d[i][j] + b.d[i][j];
+    return out;
+  }
+
+  // Çıkarma
+  Mat<R,C> operator-(const Mat<R,C>& b) const {
+    Mat<R,C> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[i][j] = d[i][j] - b.d[i][j];
+    return out;
+  }
+
+  // Skaler çarpım
+  Mat<R,C> operator*(ld s) const {
+    Mat<R,C> out;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++)
+        out.d[i][j] = d[i][j] * s;
+    return out;
+  }
+};
+
+// ----------------------------------------------------------------
+//  Kare matris tersi — Gauss-Jordan eliminasyon (long double)
+// ----------------------------------------------------------------
+template<int N>
+Mat<N,N> matInv(const Mat<N,N>& A) {
+  ld a[N][N], inv[N][N];
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++) {
+      a[i][j]   = A.d[i][j];
+      inv[i][j] = (i == j) ? 1.0L : 0.0L;
+    }
+
+  for (int col = 0; col < N; col++) {
+    // Pivot seç
+    int pivot = col;
+    for (int row = col+1; row < N; row++)
+      if (fabsl(a[row][col]) > fabsl(a[pivot][col])) pivot = row;
+
+    // Satır değiştir
+    for (int j = 0; j < N; j++) {
+      ld tmp  = a[col][j];   a[col][j]   = a[pivot][j];   a[pivot][j]   = tmp;
+      tmp     = inv[col][j]; inv[col][j] = inv[pivot][j]; inv[pivot][j] = tmp;
+    }
+
+    ld div = a[col][col];
+    if (fabsl(div) < 1e-30L) continue; // Tekil matris koruması
+
+    for (int j = 0; j < N; j++) {
+      a[col][j]   /= div;
+      inv[col][j] /= div;
+    }
+
+    for (int row = 0; row < N; row++) {
+      if (row == col) continue;
+      ld factor = a[row][col];
+      for (int j = 0; j < N; j++) {
+        a[row][j]   -= factor * a[col][j];
+        inv[row][j] -= factor * inv[col][j];
+      }
+    }
+  }
+
+  Mat<N,N> out;
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++)
+      out.d[i][j] = inv[i][j];
+  return out;
+}
+
+// ----------------------------------------------------------------
+//  Roket fizik modeli
+// ----------------------------------------------------------------
+struct RoketDurumu {
+  ld zaman;       // s
+  ld irtifa;      // m
+  ld hiz;         // m/s  (dikey)
+  ld ivme;        // m/s² (dikey)
+  ld roll;        // rad
+  ld pitch;       // rad
+  ld yaw;         // rad
+  ld roll_rate;   // rad/s
+  ld pitch_rate;  // rad/s
+  ld yaw_rate;    // rad/s
+  ld kitle;       // kg
+  bool motorAktif;
+  bool apogee;
+  bool indi;
+};
+
+// ISA modeliyle basınç hesapla (Pa)
+ld irtifahaBasinc(ld h) {
+  if (h < 0.0L) h = 0.0L;
+  return P0 * powl(1.0L - L * h / T0, G / (R_AIR * L));
+}
+
+// Basınçtan irtifa hesapla (m)
+ld basincaIrtifa(ld P) {
+  if (P <= 0.0L) return 0.0L;
+  return (T0 / L) * (1.0L - powl(P / P0, R_AIR * L / G));
+}
+
+// Hava yoğunluğu (kg/m³)
+ld yogunluk(ld h) {
+  if (h < 0.0L) h = 0.0L;
+  ld T = T0 - L * h;
+  ld P = irtifahaBasinc(h);
+  return P / (R_AIR * T);
+}
+
+// ----------------------------------------------------------------
+//  Kalman Filtresi — Full 6-DOF
+//  Durum: [irtifa, hız_z, ivme_z, roll, pitch, yaw]
+// ----------------------------------------------------------------
+struct KalmanFiltresi {
+  // Durum vektörü
+  Mat<6,1> x;   // [h, vz, az, roll, pitch, yaw]
+
+  // Kovaryans matrisi
+  Mat<6,6> P;
+
+  // Geçiş matrisi F (6×6)
+  Mat<6,6> F;
+
+  // Süreç gürültüsü Q (6×6)
+  Mat<6,6> Q;
+
+  // Ölçüm matrisi H (4×6)
+  // Ölçümler: [baro1_irtifa, baro2_irtifa, ivme_z1, ivme_z2]
+  Mat<4,6> H;
+
+  // Ölçüm gürültüsü R (4×4)
+  Mat<4,4> R_mat;
+
+  // Kalman kazancı K (6×4)
+  Mat<6,4> K;
+
+  // Son inovasyon
+  Mat<4,1> inovasyon;
+
+  void baslat(ld baslangic_irtifa) {
+    // Başlangıç durumu
+    x.zero();
+    x.d[0][0] = baslangic_irtifa;
+
+    // Başlangıç kovaryansı — büyük belirsizlik
+    P.eye();
+    P.d[0][0] = 10.0L;    // irtifa belirsizliği (m²)
+    P.d[1][1] = 1.0L;     // hız belirsizliği
+    P.d[2][2] = 0.5L;     // ivme belirsizliği
+    P.d[3][3] = 0.01L;    // roll belirsizliği
+    P.d[4][4] = 0.01L;    // pitch belirsizliği
+    P.d[5][5] = 0.01L;    // yaw belirsizliği
+
+    // Süreç gürültüsü Q
+    Q.zero();
+    Q.d[0][0] = 0.1L;
+    Q.d[1][1] = 0.5L;
+    Q.d[2][2] = 1.0L;
+    Q.d[3][3] = 0.001L;
+    Q.d[4][4] = 0.001L;
+    Q.d[5][5] = 0.001L;
+
+    // Ölçüm matrisi H
+    // baro1 → irtifa
+    H.d[0][0] = 1.0L;
+    // baro2 → irtifa (füzyon)
+    H.d[1][0] = 1.0L;
+    // ivme1 → ivme_z
+    H.d[2][2] = 1.0L;
+    // ivme2 → ivme_z
+    H.d[3][2] = 1.0L;
+
+    // Ölçüm gürültüsü R
+    // BMP390 sınıfı: ~±0.5m irtifa çözünürlüğü → σ²=0.25
+    R_mat.zero();
+    R_mat.d[0][0] = 0.25L;   // baro1
+    R_mat.d[1][1] = 0.30L;   // baro2 (biraz daha gürültülü)
+    R_mat.d[2][2] = 0.04L;   // ivme1 (σ=0.2 m/s²)
+    R_mat.d[3][3] = 0.05L;   // ivme2
+  }
+
+  // Geçiş matrisini dt için güncelle
+  void gecisMatrisiGuncelle(ld dt) {
+    F.eye();
+    // Kinematik: h += vz*dt + 0.5*az*dt²
+    F.d[0][1] = dt;
+    F.d[0][2] = 0.5L * dt * dt;
+    // vz += az*dt
+    F.d[1][2] = dt;
+    // Açısal: roll += roll_rate*dt  (basitleştirilmiş)
+    // Açısal hız ayrı tutulmadı — yaw/pitch/roll gürültü modeliyle yürüyor
+    // İleride genişletilebilir
+  }
+
+  // Tahmin adımı (Predict)
+  void tahmin(ld dt, ld dis_ivme) {
+    gecisMatrisiGuncelle(dt);
+
+    // Kontrol girişi: dış ivme (motor + yerçekimi + sürükleme)
+    Mat<6,1> u;
+    u.d[2][0] = dis_ivme;  // ivme doğrudan ivme durumuna eklenir
+
+    // x = F*x + u
+    x = F * x + u;
+
+    // P = F*P*Fᵀ + Q
+    P = F * P * F.T() + Q;
+  }
+
+  // Güncelleme adımı (Update) — 4 ölçüm ile
+  void guncelle(ld baro1_h, ld baro2_h, ld acc1_z, ld acc2_z) {
+    Mat<4,1> z;
+    z.d[0][0] = baro1_h;
+    z.d[1][0] = baro2_h;
+    z.d[2][0] = acc1_z;
+    z.d[3][0] = acc2_z;
+
+    // İnovasyon: y = z - H*x
+    inovasyon = z - H * x;
+
+    // İnovasyon kovaryansı: S = H*P*Hᵀ + R
+    Mat<4,4> S = H * P * H.T() + R_mat;
+
+    // Kalman kazancı: K = P*Hᵀ*S⁻¹
+    K = P * H.T() * matInv<4>(S);
+
+    // Durum güncellemesi: x = x + K*y
+    x = x + K * inovasyon;
+
+    // Kovaryans güncellemesi: P = (I - K*H)*P
+    Mat<6,6> I; I.eye();
+    P = (I - K * H) * P;
+  }
+
+  ld irtifa()   const { return x.d[0][0]; }
+  ld hiz()      const { return x.d[1][0]; }
+  ld ivme()     const { return x.d[2][0]; }
+  ld roll()     const { return x.d[3][0]; }
+  ld pitch()    const { return x.d[4][0]; }
+  ld yaw()      const { return x.d[5][0]; }
+};
+
+// ----------------------------------------------------------------
+//  Sensör simülasyonu — Gaussian gürültü (Box-Muller)
+// ----------------------------------------------------------------
+ld gaussGurultu(ld sigma) {
+  static bool hazir = false;
+  static ld   yedek = 0.0L;
+  if (hazir) { hazir = false; return yedek * sigma; }
+  ld u1 = (ld)random(1, 1000000) / 1000000.0L;
+  ld u2 = (ld)random(1, 1000000) / 1000000.0L;
+  ld z0 = sqrtl(-2.0L * logl(u1)) * cosl(2.0L * M_PIl * u2);
+  ld z1 = sqrtl(-2.0L * logl(u1)) * sinl(2.0L * M_PIl * u2);
+  yedek = z1; hazir = true;
+  return z0 * sigma;
+}
+
+// ----------------------------------------------------------------
+//  Global değişkenler
+// ----------------------------------------------------------------
+RoketDurumu  roket;
+KalmanFiltresi kalman;
+bool simBasladi = false;
+int  adimSayisi = 0;
+
+// LCD sayfa değiştirme
+uint8_t        lcdSayfa    = 0;     // 0=irtifa+hız, 1=ivme+basınç, 2=açılar
+elapsedMillis  lcdSayfaMs;          // sayfa zamanlayıcı
+const uint16_t LCD_SAYFA_MS = 3000; // her 3 saniyede sayfa değişir
+
+// ----------------------------------------------------------------
+//  Yardımcı: sayıyı belirli genişlikte sağa yaslı String'e çevir
+// ----------------------------------------------------------------
+String sabitGenislik(double val, int toplam, int ondalik) {
+  String s = String(val, ondalik);
+  while ((int)s.length() < toplam) s = " " + s;
+  if ((int)s.length() > toplam) s = s.substring(0, toplam);
+  return s;
+}
+
+// ----------------------------------------------------------------
+//  LCD güncelleme — her adımda çağrılır
+// ----------------------------------------------------------------
+void lcdGuncelle() {
+  // Sayfa zamanı dolduysa ilerle
+  if (lcdSayfaMs >= LCD_SAYFA_MS) {
+    lcdSayfaMs = 0;
+    lcdSayfa   = (lcdSayfa + 1) % 3;
+    lcd.clear();
+  }
+
+  double irtifa  = (double)kalman.irtifa();
+  double hiz     = (double)kalman.hiz();
+  double ivme    = (double)kalman.ivme();
+  double P_hPa   = (double)(irtifahaBasinc(roket.irtifa) / 100.0L);
+  double roll_d  = (double)(kalman.roll()  * 180.0L / M_PIl);
+  double pitch_d = (double)(kalman.pitch() * 180.0L / M_PIl);
+  double yaw_d   = (double)(kalman.yaw()   * 180.0L / M_PIl);
+
+  lcd.setCursor(0, 0);
+  lcd.setCursor(0, 1);
+
+  switch (lcdSayfa) {
+
+    case 0:
+      // Satır 1: H:1234.5m
+      // Satır 2: V: +56.3m/s
+      lcd.setCursor(0, 0);
+      lcd.print("H:");
+      lcd.print(sabitGenislik(irtifa, 7, 1));
+      lcd.print("m");
+      // sağ taraf: motor/apogee göstergesi (4 karakter)
+      lcd.setCursor(12, 0);
+      if (!simBasladi)          lcd.print("BEKL");
+      else if (roket.motorAktif)lcd.print("MTR!");
+      else if (roket.apogee)    lcd.print("APOG");
+      else if (roket.indi)      lcd.print("INDI");
+      else                      lcd.print("UCUS");
+
+      lcd.setCursor(0, 1);
+      lcd.print("V:");
+      lcd.print(sabitGenislik(hiz, 7, 2));
+      lcd.print("m/s ");
+      break;
+
+    case 1:
+      // Satır 1: A: +9.81m/s2
+      // Satır 2: P:1013.2hPa
+      lcd.setCursor(0, 0);
+      lcd.print("A:");
+      lcd.print(sabitGenislik(ivme, 7, 2));
+      lcd.print("m/s2");
+
+      lcd.setCursor(0, 1);
+      lcd.print("P:");
+      lcd.print(sabitGenislik(P_hPa, 7, 1));
+      lcd.print(" hPa");
+      break;
+
+    case 2:
+      // Satır 1: R:+1.2 P:+0.3
+      // Satır 2: Y:+0.5  t:12s
+      lcd.setCursor(0, 0);
+      lcd.print("R:");
+      lcd.print(sabitGenislik(roll_d,  4, 1));
+      lcd.print(" P:");
+      lcd.print(sabitGenislik(pitch_d, 4, 1));
+
+      lcd.setCursor(0, 1);
+      lcd.print("Y:");
+      lcd.print(sabitGenislik(yaw_d, 4, 1));
+      lcd.print("  t:");
+      lcd.print(sabitGenislik((double)roket.zaman, 4, 1));
+      lcd.print("s");
+      break;
+  }
+}
+
+// ----------------------------------------------------------------
+//  Roket fizik adımı
+// ----------------------------------------------------------------
+void roketAdim() {
+  ld t  = roket.zaman;
+  ld dt = DT;
+
+  // Kitle azalması (yakıt tüketimi)
+  if (t < MOTOR_SURE && roket.motorAktif) {
+    ld yakit_hizi = YAKIT_KG / MOTOR_SURE;
+    roket.kitle -= yakit_hizi * dt;
+    if (roket.kitle < (ROKET_KG - YAKIT_KG))
+      roket.kitle = ROKET_KG - YAKIT_KG;
+  }
+
+  // Motor aktif mi?
+  roket.motorAktif = (t < MOTOR_SURE && roket.kitle > (ROKET_KG - YAKIT_KG + 0.01L));
+
+  // Kuvvetler
+  ld F_motor   = roket.motorAktif ? ROKET_ITME : 0.0L;
+  ld rho       = yogunluk(roket.irtifa);
+  ld v         = roket.hiz;
+  ld F_surukleme = 0.5L * rho * v * fabsl(v) * CD * A_KESIT;
+  ld F_yer       = -roket.kitle * G;
+  ld F_net       = F_motor + F_yer - F_surukleme;
+
+  // Net ivme
+  roket.ivme = F_net / roket.kitle;
+
+  // Apogee kontrolü
+  if (!roket.apogee && roket.hiz < 0.0L && roket.irtifa > 10.0L)
+    roket.apogee = true;
+
+  // İniş kontrolü
+  if (roket.irtifa <= 0.0L && t > 1.0L) {
+    roket.irtifa = 0.0L;
+    roket.hiz    = 0.0L;
+    roket.ivme   = 0.0L;
+    roket.indi   = true;
+  }
+
+  // Euler integrasyon
+  if (!roket.indi) {
+    roket.hiz    += roket.ivme * dt;
+    roket.irtifa += roket.hiz  * dt;
+    if (roket.irtifa < 0.0L) roket.irtifa = 0.0L;
+  }
+
+  // Açısal simülasyon (basit gürültü modeli — IMU füzyonu için)
+  roket.roll  += gaussGurultu(0.005L);
+  roket.pitch += gaussGurultu(0.003L);
+  roket.yaw   += gaussGurultu(0.003L);
+
+  roket.zaman += dt;
+}
+
+// ----------------------------------------------------------------
+//  Kalman güncelleme adımı
+// ----------------------------------------------------------------
+void kalmanAdim() {
+  ld ger_irtifa = roket.irtifa;
+  ld ger_ivme   = roket.ivme;
+
+  // Sensör 1: BMP390 simülasyonu (σ_h=0.5m, σ_P=2Pa)
+  ld baro1_P  = irtifahaBasinc(ger_irtifa) + gaussGurultu(2.0L);
+  ld baro1_h  = basincaIrtifa(baro1_P);
+
+  // Sensör 2: MS5611 simülasyonu (σ_h=0.6m, σ_P=2.5Pa)
+  ld baro2_P  = irtifahaBasinc(ger_irtifa) + gaussGurultu(2.5L);
+  ld baro2_h  = basincaIrtifa(baro2_P);
+
+  // İvmemetre 1 (σ=0.2 m/s²)
+  ld acc1_z = ger_ivme + gaussGurultu(0.2L);
+  // İvmemetre 2 (σ=0.25 m/s²)
+  ld acc2_z = ger_ivme + gaussGurultu(0.25L);
+
+  // Kalman tahmin + güncelleme
+  kalman.tahmin(DT, ger_ivme);
+  kalman.guncelle(baro1_h, baro2_h, acc1_z, acc2_z);
+}
+
+// ----------------------------------------------------------------
+//  Çıktı formatı
+// ----------------------------------------------------------------
+void durumYaz() {
+  uint32_t t_us = micros();
+
+  // Basınç değerleri
+  ld P_ger   = irtifahaBasinc(roket.irtifa);
+  ld P_hPa   = P_ger / 100.0L;
+
+  // Kalman kazancı özeti (K matrisinin 0,0 elemanı temsili)
+  ld K_00 = kalman.K.d[0][0];
+  ld K_11 = kalman.K.d[1][1];
+  ld K_22 = kalman.K.d[2][2];
+
+  uint32_t islem_us = micros() - t_us;
+
+  Serial.println(F("┌─────────────────────────────────────────────────────┐"));
+  Serial.print(F("│  Adım: ")); Serial.print(adimSayisi);
+  Serial.print(F("   t = ")); Serial.print((double)roket.zaman, 3);
+  Serial.println(F(" s"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  GERÇEK DEĞERLER"));
+  Serial.print(F("│  İrtifa  : ")); Serial.print((double)roket.irtifa, 4); Serial.println(F(" m"));
+  Serial.print(F("│  Hız     : ")); Serial.print((double)roket.hiz,    4); Serial.println(F(" m/s"));
+  Serial.print(F("│  İvme    : ")); Serial.print((double)roket.ivme,   4); Serial.println(F(" m/s²"));
+  Serial.print(F("│  Roll    : ")); Serial.print((double)(roket.roll  * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Pitch   : ")); Serial.print((double)(roket.pitch * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Yaw     : ")); Serial.print((double)(roket.yaw   * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Basınç  : ")); Serial.print((double)P_hPa, 4); Serial.println(F(" hPa"));
+  Serial.print(F("│  Kütle   : ")); Serial.print((double)roket.kitle, 3); Serial.println(F(" kg"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  KALMAN FİLTRESİ (6-DOF Sensor Fusion)"));
+  Serial.print(F("│  İrtifa  : ")); Serial.print((double)kalman.irtifa(), 4); Serial.println(F(" m"));
+  Serial.print(F("│  Hız     : ")); Serial.print((double)kalman.hiz(),    4); Serial.println(F(" m/s"));
+  Serial.print(F("│  İvme    : ")); Serial.print((double)kalman.ivme(),   4); Serial.println(F(" m/s²"));
+  Serial.print(F("│  Roll    : ")); Serial.print((double)(kalman.roll()  * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Pitch   : ")); Serial.print((double)(kalman.pitch() * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.print(F("│  Yaw     : ")); Serial.print((double)(kalman.yaw()   * 180.0L / M_PIl), 3); Serial.println(F(" °"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  KALMAN KAZANCI (K seçili elemanlar)"));
+  Serial.print(F("│  K[0,0] İrtifa  : ")); Serial.println((double)K_00, 6);
+  Serial.print(F("│  K[1,1] Hız     : ")); Serial.println((double)K_11, 6);
+  Serial.print(F("│  K[2,2] İvme    : ")); Serial.println((double)K_22, 6);
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  İNOVASYON (ölçüm - tahmin farkı)"));
+  Serial.print(F("│  Δ Baro1  : ")); Serial.print((double)kalman.inovasyon.d[0][0], 4); Serial.println(F(" m"));
+  Serial.print(F("│  Δ Baro2  : ")); Serial.print((double)kalman.inovasyon.d[1][0], 4); Serial.println(F(" m"));
+  Serial.print(F("│  Δ Acc1   : ")); Serial.print((double)kalman.inovasyon.d[2][0], 4); Serial.println(F(" m/s²"));
+  Serial.print(F("│  Δ Acc2   : ")); Serial.print((double)kalman.inovasyon.d[3][0], 4); Serial.println(F(" m/s²"));
+  Serial.println(F("├─────────────────────────────────────────────────────┤"));
+  Serial.println(F("│  SİSTEM"));
+  Serial.print(F("│  Motor   : ")); Serial.println(roket.motorAktif ? F("AKTİF 🔥") : F("SÖNDÜ"));
+  Serial.print(F("│  Apogee  : ")); Serial.println(roket.apogee ? F("GEÇİLDİ ▼") : F("Henüz değil ▲"));
+  Serial.print(F("│  İşlem   : ")); Serial.print(islem_us); Serial.println(F(" µs"));
+  Serial.println(F("└─────────────────────────────────────────────────────┘"));
+  Serial.println();
+}
+
+// ----------------------------------------------------------------
+//  Simülasyon sıfırlama
+// ----------------------------------------------------------------
+void simReset() {
+  roket.zaman     = 0.0L;
+  roket.irtifa    = 0.0L;
+  roket.hiz       = 0.0L;
+  roket.ivme      = 0.0L;
+  roket.roll      = 0.0L;
+  roket.pitch     = 0.0L;
+  roket.yaw       = 0.0L;
+  roket.roll_rate = 0.0L;
+  roket.pitch_rate= 0.0L;
+  roket.yaw_rate  = 0.0L;
+  roket.kitle     = ROKET_KG;
+  roket.motorAktif= false;
+  roket.apogee    = false;
+  roket.indi      = false;
+  kalman.baslat(0.0L);
+  simBasladi = false;
+  adimSayisi = 0;
+  Serial.println(F(">> Simülasyon sıfırlandı."));
+}
+
+// ----------------------------------------------------------------
+//  Yardım metni
+// ----------------------------------------------------------------
+void yardim() {
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+  Serial.println(F("  ROKET KALİBRASYON SİMÜLATÖRÜ — Komut Listesi"));
+  Serial.println(F("  Teensy 4.1 | 6-DOF Kalman | Dual Sensor Fusion"));
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+  Serial.println(F("  start      → Simülasyonu başlat"));
+  Serial.println(F("  step       → Tek adım ilerlet (dt=0.05s)"));
+  Serial.println(F("  run N      → N adım otomatik koş (örn: run 100)"));
+  Serial.println(F("  run full   → Roketi apogee'ye kadar koş"));
+  Serial.println(F("  status     → Mevcut durumu göster"));
+  Serial.println(F("  reset      → Simülasyonu sıfırla"));
+  Serial.println(F("  help       → Bu menüyü göster"));
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+  Serial.println(F("  Roket parametreleri:"));
+  Serial.print(F("    İtme: ")); Serial.print((double)ROKET_ITME); Serial.println(F(" N"));
+  Serial.print(F("    Kütle: ")); Serial.print((double)ROKET_KG); Serial.println(F(" kg"));
+  Serial.print(F("    Yakıt: ")); Serial.print((double)YAKIT_KG); Serial.println(F(" kg"));
+  Serial.print(F("    Motor süresi: ")); Serial.print((double)MOTOR_SURE); Serial.println(F(" s"));
+  Serial.print(F("    Adım süresi: ")); Serial.print((double)DT); Serial.println(F(" s"));
+  Serial.println(F("═══════════════════════════════════════════════════════"));
+}
+
+// ----------------------------------------------------------------
+//  setup & loop
+// ----------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);  // USB bağlantısını bekle
+
+  // LCD başlat
+  Wire.begin();
+  Wire.setClock(400000);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Roket Kalman");
+  lcd.setCursor(0, 1);
+  lcd.print("Teensy 4.1 6DOF");
+  delay(2000);
+  lcd.clear();
+
+  randomSeed(analogRead(A0) ^ micros());
+
+  simReset();
+  yardim();
+  Serial.println(F(">> 'start' yazıp Enter'a basın."));
+
+  // LCD'ye bekleme ekranı
+  lcd.setCursor(0, 0);
+  lcd.print("'start' yazin");
+  lcd.setCursor(0, 1);
+  lcd.print("Serial Monitor");
+}
+
+void loop() {
+  if (!Serial.available()) return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toLowerCase();
+
+  if (cmd == "help") {
+    yardim();
+
+  } else if (cmd == "start") {
+    if (!simBasladi) {
+      simBasladi = true;
+      lcdSayfa   = 0;
+      lcdSayfaMs = 0;
+      lcd.clear();
+      Serial.println(F(">> Simülasyon başladı! Roket ateşleniyor..."));
+      lcd.setCursor(0, 0);
+      lcd.print("Roket ateslen.");
+      lcd.setCursor(0, 1);
+      lcd.print("Hazir!");
+      delay(800);
+      lcd.clear();
+    } else {
+      Serial.println(F(">> Zaten başladı. 'reset' ile sıfırlayın."));
+    }
+
+  } else if (cmd == "step") {
+    if (!simBasladi) { Serial.println(F(">> Önce 'start' yazın.")); return; }
+    if (roket.indi)  { Serial.println(F(">> Roket indi. 'reset' ile sıfırlayın.")); return; }
+    roketAdim();
+    kalmanAdim();
+    adimSayisi++;
+    durumYaz();
+    lcdGuncelle();
+
+  } else if (cmd.startsWith("run")) {
+    if (!simBasladi) { Serial.println(F(">> Önce 'start' yazın.")); return; }
+
+    String arg = cmd.substring(4);
+    arg.trim();
+
+    int n = 0;
+    bool full = (arg == "full");
+    if (!full) n = arg.toInt();
+    if (!full && n <= 0) { Serial.println(F(">> Geçersiz sayı. Örnek: run 80")); return; }
+
+    int sayac = 0;
+    while (!roket.indi) {
+      if (!full && sayac >= n) break;
+      roketAdim();
+      kalmanAdim();
+      adimSayisi++;
+      sayac++;
+
+      // LCD her adımda güncelle
+      lcdGuncelle();
+
+      // Serial her 20 adımda bir yaz (buffer taşmasını önler)
+      if (sayac % 20 == 0 || roket.indi) {
+        durumYaz();
+        delay(10);
+      }
+    }
+    Serial.print(F(">> ")); Serial.print(sayac);
+    Serial.println(F(" adım tamamlandı."));
+    if (roket.indi) {
+      Serial.println(F(">> ✓ Roket yere indi! Uçuş tamamlandı."));
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("INIS TAMAMLANDI");
+      lcd.setCursor(0, 1);
+      lcd.print("t=");
+      lcd.print((double)roket.zaman, 1);
+      lcd.print("s  'reset'");
+    }
+
+  } else if (cmd == "status") {
+    durumYaz();
+    lcdGuncelle();
+
+  } else if (cmd == "reset") {
+    simReset();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Sifirlandi.");
+    lcd.setCursor(0, 1);
+    lcd.print("'start' bekliyor");
+
+  } else if (cmd.length() > 0) {
+    Serial.print(F(">> Bilinmeyen komut: '"));
+    Serial.print(cmd);
+    Serial.println(F("'  — 'help' yazın."));
+  }
+}
